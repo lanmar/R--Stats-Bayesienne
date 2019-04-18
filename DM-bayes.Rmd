@@ -1,0 +1,636 @@
+---
+title: "DM Bayes"
+output: 
+  html_document: 
+    theme: cosmo
+    toc: yes
+  html_notebook: 
+    toc: yes
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(car)
+library(MASS)
+library(BAS)
+library(rmutil)
+```
+
+```{r set-seed}
+set.seed(180484)
+```
+
+
+Les enseignants des collèges et lycées français souhaitant obtenir une mutation professionnelle sont
+classés en fonction d'un nombre de points qui dépend de leur situation personnelle et de leur carrière.
+Le fichier mutations2.csv donne le nombre de points nécessaire pour obtenir une mutation dans
+les lycées de l'académie de Versailles en 2012, pour diverses disciplines enseignées ; c'est une mesure
+de l'attractivité de chaque établissement pour les enseignants. Par exemple, en mathématiques, il
+sufisait de 21 points pour pouvoir être nommé au lycée Georges Braque d'Argenteuil, mais il en
+fallait 464 pour être nommé au lycée Michelet de Vanves. Nous allons étudier ce nombre de points,
+dans un cadre bayésien.  
+Pour des couples (établissement, discipline), on dispose du nombre de points nécessaire (colonne
+Barre) pour obtenir une mutation, ainsi que de caractéristiques de l'établissement : nombre de
+candidats au baccalauréat par série, taux de réussite au baccalauréat par série, taux de réussite
+attendu (qui dépend notamment du tissu socioprofessionnel des parents d'élèves), taux d'accès des
+élèves de seconde et de première au baccalauréat. Par souci d'homogénéité des données, on considère
+uniquement les filières du lycée général, m^eme si beaucoup des établissements concernés préparent
+aussi au baccalauréat technologique et parfois au baccalauréat professionnel.
+
+# Les données
+
+Commençons par charger les données :
+```{r}
+mutations <- read.csv("mutations2.csv")
+```
+
+Présentation des variables :
+```{r}
+glimpse(mutations)
+```
+
+
+variable                             | description
+------------------------------------ | ------------------------------------------------------------------------
+`code_etablissement`                 | code de l'établissement
+`ville`                              | ville où est situé l'établissement
+`etablissement`                      | nom de l'établissement
+`commune`                            | code postal de la commune où est situé l'établissement
+`Matiere`                            | discipline
+`Barre`                              | nombre de points nécessaires pour être muté dans cet établissement pour cette discipline
+`effectif_presents_serie_l`          | nombre de candidats au baccalauréat en série L
+`effectif_presents_serie_es`         | nombre de candidats au baccalauréat en série ES
+`effectif_presents_serie_s`          | nombre de candidats au baccalauréat en série S
+`taux_brut_de_reussite_serie_l`      | taux de réussite brut au baccalauréat en série L
+`taux_brut_de_reussite_serie_es`     | taux de réussite brut au baccalauréat en série ES
+`taux_brut_de_reussite_serie_s`      | taux de réussite brut au baccalauréat en série S
+`taux_reussite_attendu_serie_l`      | taux de réussite attendu en série L
+`taux_reussite_attendu_serie_es`     | taux de réussite attendu en série ES
+`taux_reussite_attendu_serie_s`      | taux de réussite attendu en série S
+`effectif_de_seconde`                | nombre d'élèves en classe de seconde
+`effectif_de_premiere`               | nombre d'élèves en classe de première
+`taux_acces_brut_seconde_bac`        | taux d'accès brut des élèves de seconde au baccalauréat
+`taux_acces_attendu_seconde_bac`     | taux d'accès attendu des élèves de seconde au baccalauréat
+`taux_acces_brut_premiere_bac`       | taux d'accès brut des élèves de première au baccalauréat
+`taux_acces_attendu_premiere_bac`    | taux d'accès attendu des élèves de première au baccalauréat
+`taux_brut_de_reussite_total_series` | taux de réussite brut au baccalauréat toutes séries confondues
+`taux_reussite_attendu_total_series` |  taux de réussite attendu au baccalauréat toutes séries confondues
+
+Nous sommes ici en présence de données observées (et pas de données issues d'une expérimentation).
+
+Regardons de plus près les valeurs :
+```{r}
+summary(mutations)
+```
+
+Il n'y a pas de données manquantes.
+La variable `commune` doit être retravaillée pour être transformée en variable de catégorie :
+```{r}
+mutations$commune <- as.factor(mutations$commune)
+
+mutations %>%
+  group_by(ville, commune) %>%
+  summarise(n = n()) %>%
+  arrange(desc(n))
+length(unique(mutations$ville))
+```
+
+On peut constater qu'à chaque ville correspond un unique code postal. Nous devons donc utiliser qu'une seule de ces 2 variables dans nos modèles. 
+
+Au lieu de regarder la ville, on pourra également s'intéresser au département. Pour cela, nous pouvons créer une nouvelle variable en prenant les 2 premiers chiffres du code postal :
+```{r}
+mutations <- mutations %>%
+  mutate(departement = as.integer(str_sub(as.character(commune), 1, 2)))
+```
+On garde les départements en tant que nombres et pas facteur de façon à pouvoir utiliser cette variable dans le calcul manuel des coefficients avec la loi a priori g de Zellner.
+
+# EDA - Analyse exploratoire des données
+
+Commençons par observer la distribution de variable `Barre` puisque c'est la variable réponse de nos modèles :
+```{r}
+ggplot(data = mutations, aes(x = Barre)) +
+  geom_histogram(binwidth = 100)
+```
+
+Et complétons cet histogramme par quelques informations statistiques qui le résument :
+```{r}
+summary(mutations$Barre)
+```
+
+La distribution présente une queue à droite, ce qui signifie que la majorité des observations présentent un `Barre` en dessous de la moyenne plutôt qu'au-dessus. En effet, 50% des observations sont sous la valeur de 196 alors que la moyenne se situe à 321.9. La valeur maximum se situe à 2056, qui est très éloignée de la moyenne et de la mediane.
+
+
+Regardons la corrélation des variables avec la fonction pairs :
+```{r, fig.width=10, fig.height=10}
+pairs(mutations[,7:23], pch='.')
+```
+
+Les effectifs de seconde et de première sont très corrélés.
+
+```{r, echo=TRUE, results='hide'}
+m1 <- lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series + 
+    departement, data = mutations)
+vif(m1)
+
+mutations_datamatrix=data.matrix(mutations)
+options(max.print=1000000)
+cor(mutations_datamatrix)
+```
+
+Nous avons masqué le résultat car il est beaucoup trop verbeux. Les conclusions à en tirer sont les suivantes :  
+* Les effectifs sont tous corrélés entre eux.  
+* Les taux brut de réussite sont corrélés aux taux de réussite attendus.   
+* Les taux d'accès sont corrélés à tous les autres taux.  
+* Les taux de réussite total sont corrélés aux taux de réussite brut et attendus de chaque série.  
+
+# 1. Régression linéaire
+
+On propose d'abord un modèle linéaire gaussien. On cherche à expliquer le nombre de points nécessaire à une mutation (colonne Barre) par les caractéristiques du lycée.
+
+## 1. Effectuer une régression linéaire bayésienne et interpréter les coefficients obtenus.
+
+On commence avec un modèle contenant toutes les variables sauf le code établissement, la ville, l'établissement, la commune, la matière.
+
+```{r}
+model_1 <- lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series + 
+    departement, data = mutations)
+summary(model_1)
+```
+
+On réalise une inférence bayésienne à l'aide de la loi a prior g de Zellner, et on obtient a posteriori les espérances de sigma^2 et des Beta :
+```{r}
+betahat = model_1$coefficients
+residuals = model_1$residuals
+s2 = t(residuals)%*%residuals
+X <- as.matrix(mutations[, 7:24])
+X = cbind(1,X) # on ajoute une colonne de 1 pour beta_0
+m = ncol(X)
+n = nrow(mutations)
+g = n
+
+# espérance de sigma^2
+a = n/2
+b = s2/2 + 1/(2*g+2) * ((t(betahat)%*%t(X))%*%(X%*%betahat))
+print(paste("Espérance de sigma^2 :", round(b/(a-1), 2)))
+
+# espérance des beta:
+for (i in 1:m) {
+  print(paste("Beta", i-1, ":", round(betahat[i]*g/(g+1), 2)))
+  }
+```
+
+On obtient des coefficients proches de ceux obtenus avec la régression linéaire standard (ce qui était attendu).
+
+On observe un intercept élevé, et une influence forte des coefficients suivant :  
+`taux_acces_attendu_premiere_bac` Beta 15 = 34.38  
+`taux_acces_brut_premiere_bac` Beta 14 = -20.35  
+`taux_reussite_attendu_serie_l` Beta 7 = -14.26  
+`taux_acces_brut_seconde_bac` Beta 12 = 10.72  
+De plus, on observe via la régression linéaire classique que ces coefficients sont ceux qui semblent être significatifs.
+
+
+## 2. Choisir les covariables significatives. Comparer au résultat obtenu par une analyse fréquentiste.
+
+
+### Step AIC en fréquentiste
+
+Voyons ce que donne un step AIC pour la sélection de modèle en fréquentiste :
+
+```{r}
+best_model <- stepAIC(model_1,  trace=FALSE)
+best_model$anova
+```
+
+On obtient le modèle 2 suivant : Barre ~ taux_reussite_attendu_serie_l + taux_acces_attendu_premiere_bac
+
+```{r}
+model_2 <- lm(Barre ~ taux_reussite_attendu_serie_l + taux_acces_attendu_premiere_bac, data = mutations)
+summary(model_2)
+```
+
+
+
+### Step BIC en analyse bayésienne
+
+Nous allons réaliser un step BIC (Bayesian Information Criterion). Plus le BIC est petit, plus le modèle est à privilégier. En effet le BIC correspond à $BIC = -2ln(likelihood) + (p+1)ln(n)$. Plus on maximise la vraisemblance et plus on minimise le BIC, avec une pénalité sur le nombre de paramètres : n étant le nombre d'observations et p le nombre de coefficients avec l'intercept. 
+
+Pour faire un step BIC avec R, il est nécessaire d'indiquer k=log(n) dans la fonction stepAIC, qui devient alors un stepBIC.
+
+```{r}
+n <- nrow(mutations)
+best_model_B <- stepAIC(model_1, k=log(n), trace=FALSE)
+best_model_B$anova
+```
+
+On obtient alors un modèle très simple : Barre ~ taux_acces_attendu_premiere_bac
+
+```{r}
+model_3 <- lm(Barre ~ taux_acces_attendu_premiere_bac, data = mutations)
+summary(model_3)
+```
+
+En analyse bayésienne nous gardons donc la variable `taux_acces_attendu_premiere_bac` comme pour l'analyse fréquentiste, mais nous ne conservons pas la variable `taux_reussite_attendu_serie_l`
+
+
+###  Sélection de modèle en calculant la probabilité postérieure des différents modèles
+
+On va également utiliser la librairie BAS pour calculer les probabilités postérieures des différents modèles.
+Pour la prior sur les coefficients, on utilise la loi informative de Zellner g-prior. On utilise ensuite modelprior = uniform() pour assigner une probabilité égale p(Mm) à chaque modèle.
+
+```{r}
+# Fit le modèle en utilisant la régression linéaire Bayésienne
+bma_Barre <- bas.lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series + 
+    departement, data = mutations,
+    prior = "g-prior", alpha = n,
+    modelprior = uniform())
+
+# Affiche la probabilité marginale postérieure d'inclusion de chaque variable
+bma_Barre
+
+# Les 5 modèles les plus probables
+summary(bma_Barre)
+```
+
+La sortie nous donne à la fois la probabilité postérieure d'inclusion de chaque variable et les probabilités de chaque modèle.
+Par exemple, la probabilité postérieure que `taux_acces_attendu_premiere_bac` soit inclus dans le modèle est de 0.319
+De plus, le modèle le plus probable, qui a une probabilité postérieure de 0.1252, inclus l'intercept et la variable `taux_acces_attendu_premiere_bac`.
+La probabilité de 0.1252 semble faible, mais elle est largement supérieure à la probabilité de la prior uniforme qui lui était assignée étant donné qu'il y a $2^{17}$ modèles possibles.
+Cela confirme le modèle obtenu avec stepBIC.
+
+On peut également visualiser les différents modèles pour les comparer :
+```{r}
+image(bma_Barre, rotate = F, cex.axis = 0.6)
+title(font.main=2)
+```
+
+Les modèles sont rangés selon le log du posterior odd sur le modèle contenant seulement l'intercept (et ce log correspond au log du Bayes Factor).
+
+
+Etant donné qu'on a les probabilités postérieures de chaque modèle, on peut calculer le BMA - Bayesian Model Average, qui est une moyenne pondérée des différents modèles selon leur probabilité.  
+Voici les coefficients selon le BMA :
+```{r}
+coef_Barre <- coefficients(bma_Barre)
+coef_Barre
+```
+
+On peut aussi voir la distribution postérieure de ces coefficients sous le modèle BMA (et remarquer que certains ont 0 bien au milieu de leur intervalle de crédibilité) :
+  
+```{r, fig.width=10, fig.height=14}
+# on plot les distributions de ces coefficients
+par(mfrow = c(7,3))
+plot(coef_Barre, ask = FALSE)
+```
+
+Nous pouvons également fournir les intervalles de crédibilité à 95% pour ces coefficients :
+  
+```{r conf-BMA}
+confint(coef_Barre)
+```
+
+### Premières conclusions
+
+Il est intéressant de constater que la méthode fréquentiste et la méthode bayésienne ne donnent pas les mêmes résultats. Les deux méthodes sont d'accord pour affirmer que la variable `taux_acces_attendu_premiere_bac` a une influence sur la variable `Barre`. En revanche, là où la méthode fréquentiste va préconiser d'intégrer également la variable `taux_reussite_attendu_serie_l` dans le modèle, la méthode bayésienne aura plutôt tendance à ne garder que la premièree variable ou alors à mettre du poids également sur les variables `taux_acces_attendu_seconde_bac` et `taux_brut_de_reussite_total_series`.
+Il peut être intéressant de regarder ce qui se passe par Matière car un professeur de Maths sera peut-être moins intéressé par le `taux_reussite_attendu_serie_l`.
+
+
+## 3. On se concentre maintenant uniquement sur les mutations en mathématiques et en anglais. 
+
+*Répéter l'analyse pour chacune de ces deux catégories. Que penser de l'hypothèse que les covariables agissent de la même manière dans ces deux disciplines ?*
+
+
+On crée des sous-jeux de données pour chaque Matière :
+```{r}
+mutations_Maths <- mutations %>%
+  filter(Matiere == 'MATHS')
+
+mutations_Anglais <- mutations %>%
+  filter(Matiere == 'ANGLAIS')
+```
+
+### Maths
+
+Réalisons d'abord une régression linéaire pour les Mathématiques, avec l'ensemble des variables excepté le code établissement, l'établissement, la ville, la commune :
+
+```{r}
+Maths_model_1 <- lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series +
+    departement, data = mutations_Maths)
+summary(Maths_model_1)
+```
+
+On s'aperçoit que le département 91 influence fortement la note Barre par rapport au département 78 pour cette matière.
+
+Sélectionnons le meilleur modèle avec la méthode fréquentiste AIC :
+
+```{r}
+best_model_maths <- stepAIC(Maths_model_1, trace=FALSE)
+best_model_maths$anova
+```
+
+On obtient le modèle suivant :
+Barre ~ effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac
+
+
+```{r}
+Maths_model_2  = lm(Barre ~ effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac, data = mutations_Maths)
+summary(Maths_model_2)
+```
+
+Effectuons maintenant le choix de modèle par BIC :
+
+```{r}
+n <- nrow(mutations_Maths)
+best_model_maths_B <- stepAIC(Maths_model_1, k=log(n), trace=FALSE)
+best_model_maths_B$anova
+```
+
+On obtient un modèle plus simple qui ne dépend que de la variable `taux_brut_de_reussite_serie_es`.
+
+```{r}
+Maths_model_3 = lm(Barre ~ taux_brut_de_reussite_serie_es, data = mutations_Maths)
+summary(Maths_model_3)
+```
+
+Calculons maintenant les probabiltiés postérieures des différents modèles avec la libraire BAS :
+
+```{r}
+# Fit le modèle en utilisant la régression linéaire Bayésienne
+Maths_bma_Barre <- bas.lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series +
+    departement, data = mutations_Maths,
+    prior = "g-prior", alpha = n,
+    modelprior = uniform())
+
+# Affiche la probabilité marginale postérieure d'inclusion de chaque variable              
+Maths_bma_Barre
+
+# Les 5 modèles les plus probables
+summary(Maths_bma_Barre)
+```
+
+On retrouve le meilleur modèle identifié avec BIC, et ce modèle est suivi de près par un modèle qui inclut le `taux_brut_de_reussite_serie_l` en plus du `taux_brut_de_reussite_serie_es`. On peut constater que la variable correspondante pour la filière S influe moins.  
+
+Etant donné qu'on a les probabilités postérieures de chaque modèle, on peut calculer le BMA - Bayesian Model Average, qui est une moyenne pondérée des différents modèles selon leur probabilité.  
+Voici les coefficients selon le BMA, avec leur écart-type et leur probabilité :
+
+```{r}
+coef_Maths_BMA_Barre <- coefficients(Maths_bma_Barre)
+coef_Maths_BMA_Barre
+```
+
+On constate que la variable `taux_brut_de_reussite_serie_l` a un effet négatif sur `Barre` alors que la variable `taux_brut_de_reussite_serie_es` a un effet positif.
+
+
+### Anglais
+
+Réalisons maintenant une régression linéaire pour l'Anglais, avec l'ensemble des variables excepté le code établissement, l'établissement, la ville, la commune :
+
+```{r}
+Anglais_model_1 <- lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series +
+    departement
+    , data = mutations_Anglais)
+summary(Anglais_model_1)
+```
+
+Seule la variable `taux_acces_attendu_premiere_bac` semble significative.
+
+Réalisons un stepAIC :
+
+```{r}
+best_model_anglais <- stepAIC(Anglais_model_1, trace=FALSE)
+best_model_anglais$anova
+```
+
+On obtient le modèle suivant :
+Barre ~ effectif_presents_serie_l + taux_brut_de_reussite_serie_l + 
+    taux_reussite_attendu_serie_es + taux_reussite_attendu_serie_s + 
+    taux_acces_attendu_seconde_bac + taux_acces_brut_premiere_bac + 
+    taux_acces_attendu_premiere_bac + taux_brut_de_reussite_total_series + 
+    taux_reussite_attendu_total_series
+
+
+```{r}
+Anglais_model_2  = lm(Barre ~ effectif_presents_serie_l + taux_brut_de_reussite_serie_l + 
+    taux_reussite_attendu_serie_es + taux_reussite_attendu_serie_s + 
+    taux_acces_attendu_seconde_bac + taux_acces_brut_premiere_bac + 
+    taux_acces_attendu_premiere_bac + taux_brut_de_reussite_total_series + 
+    taux_reussite_attendu_total_series, data = mutations_Anglais)
+summary(Anglais_model_2)
+```
+
+Effectuons maintenant le choix de modèle par BIC :
+
+```{r}
+n <- nrow(mutations_Anglais)
+best_model_anglais_B <- stepAIC(Anglais_model_1, k=log(n), trace=FALSE)
+best_model_anglais_B$anova
+```
+
+On obtient un modèle qui ne dépend que de l'intercept. Cela signifierait qu'aucune variable n'agit réellement sur le  choix du lycée pour enseigner l'Anglais.
+
+
+Calculons maintenant les probabiltiés postérieures des différents modèles avec la libraire BAS :
+
+```{r}
+# Fit le modèle en utilisant la régression linéaire Bayésienne
+Anglais_bma_Barre <- bas.lm(Barre ~ effectif_presents_serie_l + effectif_presents_serie_es + 
+    effectif_presents_serie_s + taux_brut_de_reussite_serie_l + 
+    taux_brut_de_reussite_serie_es + taux_brut_de_reussite_serie_s + 
+    taux_reussite_attendu_serie_l + taux_reussite_attendu_serie_es + 
+    taux_reussite_attendu_serie_s + effectif_de_seconde + effectif_de_premiere + 
+    taux_acces_brut_seconde_bac + taux_acces_attendu_seconde_bac + 
+    taux_acces_brut_premiere_bac + taux_acces_attendu_premiere_bac + 
+    taux_brut_de_reussite_total_series + taux_reussite_attendu_total_series +
+    departement, data = mutations_Anglais,
+    prior = "g-prior", alpha = n,
+    modelprior = uniform())
+
+# Affiche la probabilité marginale postérieure d'inclusion de chaque variable             
+Anglais_bma_Barre
+
+# Les 5 modèles les plus probables
+summary(Anglais_bma_Barre)
+```
+
+Après le modèle qui ne contient que l'intercept, les modèles les plus probables incluent la variable `taux_brut_de_reussite_serie_es`.
+
+Etant donné qu'on a les probabilités postérieures de chaque modèle, on peut calculer le BMA - Bayesian Model Average, qui est une moyenne pondérée des différents modèles selon leur probabilité.  
+Voici les coefficients selon le BMA, avec leur écart-type et leur probabilité :
+
+```{r}
+coef_Anglais_BMA_Barre <- coefficients(Anglais_bma_Barre)
+coef_Anglais_BMA_Barre
+```
+
+### Conclusions
+
+On obtient des modèles très différents selon le choix de méthodes pour la sélection de modèles. La méthode fréquentiste tend à conserver plus de variables, là où la méthode bayésienne en garde très peu... voir pas du tout.
+
+
+
+# 2. Loi de Pareto
+
+On ignore maintenant les covariables, et on s'intéresse uniquement à la loi du nombre de points nécessaire (colonne Barre). 
+La loi gaussienne peut paraître peu pertinente pour ces données : on va plutôt proposer une loi de Pareto. 
+Pour $m > 0$ et $\alpha > 0$, on dit que $Z \sim Pareto(m; \alpha)$ si $Z$ est à valeurs dans $[m;+\infty[$ de densité
+$$f_Z(z; m, \alpha) = \alpha \frac{m^\alpha}{z^{\alpha + 1}}\mathbb{I}_\left\{z \geq m\right\}.$$
+On impose m = 21 au vu des données.
+
+## 4. Chercher un package R permettant de générer des réalisations d'une loi de Pareto. Visualiser l'impact du paramètre $\alpha$.
+
+```{r message=FALSE, warning=FALSE}
+n = 100000
+m = 21
+
+X0.1 <- VGAM::rpareto(n, m, 0.1)
+X0.2 <- VGAM::rpareto(n, m, 0.2)
+X0.3 <- VGAM::rpareto(n, m, 0.3)
+X0.4 <- VGAM::rpareto(n, m, 0.4)
+X0.5 <- VGAM::rpareto(n, m, 0.5)
+X0.6 <- VGAM::rpareto(n, m, 0.6)
+X0.7 <- VGAM::rpareto(n, m, 0.7)
+X1.0 <- VGAM::rpareto(n, m, 1)
+
+ggplot() + aes(X0.1) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X0.2) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X0.3) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X0.4) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X0.5) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X0.6) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X0.7) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+ggplot() + aes(X1.0) + geom_histogram(binwidth=10, colour="black", fill="white") + scale_x_continuous(limits=c(0,2200)) 
+
+```
+
+Plus alpha est grand et moins les données sont dispersées.
+Si on compare avec la distribution de `Barre`, on peut en déduire que $\alpha$ doit se situer aux alentours de 0.3-0.6.
+
+```{r}
+Barre = mutations$Barre
+ggplot() + aes(Barre) +
+  geom_histogram(binwidth = 10)
+```
+
+
+## 5. Choisir une loi a priori pour $\alpha$.
+
+Nous allons prendre comme priori la loi Gamma car elle est conjuguée avec la loi de Pareto.
+De façon à refléter notre croyance que $\alpha$ se situe aux alentours de 0.3-0.6, nous allons utiliser un shape de 12 et un rate de 25. Ces paramètres ont été trouvés par essais, erreurs de façon à obtenir une courbe gamma où la densité est la plus concentrée entre ces 2 points, tout en se laissant un peu de marge :
+
+```{r}
+n <- seq(0, 10, length = 500)
+ggplot() + aes(n) + stat_function(fun=dgamma, args=list(shape=12, rate=25)) + scale_x_continuous(limits=c(0,1.5)) 
+```
+
+
+
+## 6. Donner la loi a posteriori de $\alpha$.
+
+Avec la loi priori $Gamma(\lambda; \beta )$ définie ci-dessus, la loi a posteriori de $\alpha$ est la loi $Gamma(\lambda + n; \beta + {\sum\limits_{i=1}^n} ln(\frac{x_i}{m}) )$
+
+```{r}
+lambda_prior = 12
+beta_prior = 25
+
+n = length(Barre)
+
+lambda_post = lambda_prior + n
+beta_post = beta_prior + sum(log(Barre/m))
+
+x <- seq(0, 10, length = 500)
+ggplot() + aes(x) + stat_function(fun=dgamma, args=list(shape=lambda_post, rate=beta_post)) + scale_x_continuous(limits=c(0,2)) 
+
+```
+
+ $\alpha$ semble se situer entre 0.4 et 0.5.
+ 
+
+## 7. Par la méthode de votre choix, tirer un échantillon de la loi a posteriori de $\alpha$. Donner un intervalle de crédibilité à 95%.
+
+```{r}
+qgamma(c(0.025, 0.925), shape = lambda_post, rate = beta_post)
+```
+
+### Vérifications par une autre méthode
+
+On utilise la fonction vglm en lui indiquant en paramètre qu'on souhaite utiliser une loi de Pareto pour modéliser `Barre`. Cette fonction va nous permettre de vérifier les paramètres $\alpha$ et m :
+```{r message=FALSE, warning=FALSE}
+Barre_df <- data.frame(y = Barre)
+fit <- VGAM::vglm(y ~ 1, VGAM::paretoff, data = Barre_df, trace = FALSE)
+m_estimated <- fit@extra$scale 
+alpha_estimated <- exp(coef(fit))
+
+print(paste("m estimé :", m_estimated))
+print(paste("alpha estimé :", round(alpha_estimated, 2)))
+```
+
+Nous retrouvons bien le m proposé pour l'exercice et l'$\alpha$ correspond aux ordres de grandeur que nous avions identifiés.
+
+
+##8. On se concentre uniquement sur les mutations en mathématiques et en anglais. Répéter l'analyse pour chacune de ces deux catégories. 
+*Que pensez-vous de l'hypothèse que $\alpha_{maths}$ = $\alpha_{anglais}$ ?*
+
+Utilisons de nouveau la fonction vglm pour identifier $\alpha_{maths}$ et $\alpha_{anglais}$ :
+```{r}
+Barre_anglais = mutations_Anglais$Barre
+Barre_anglais_df <- data.frame(y = Barre_anglais)
+fit <- VGAM::vglm(y ~ 1, VGAM::paretoff, data = Barre_anglais_df, trace = FALSE)
+m_estimated <- fit@extra$scale  
+alpha_estimated <- exp(coef(fit))
+writeLines(paste("ANGLAIS", "\nm estimé :", m_estimated, "\nalpha estimé :", round(alpha_estimated, 2)))
+
+Barre_maths = mutations_Maths$Barre
+Barre_maths_df <- data.frame(y = Barre_maths)
+fit <- VGAM::vglm(y ~ 1, VGAM::paretoff, data = Barre_maths_df, trace = FALSE)
+m_estimated <- fit@extra$scale  
+alpha_estimated <- exp(coef(fit))
+writeLines(paste("\n\nMATHS", "\nm estimé :", m_estimated, "\nalpha estimé :", round(alpha_estimated, 2)))
+
+```
+
+Nous trouvons des $\alpha$ très proches et presque équivalents.
+
